@@ -13,6 +13,7 @@
 #include "widgets/details/InteractiveMarker.h"
 
 #include <condition_variable>
+#include <GLFW/glfw3.h>
 
 namespace mc_mujoco
 {
@@ -317,6 +318,32 @@ public:
 
   void loadPlugins(const mc_rtc::Configuration & mc_mujoco_cfg) const;
 
+  std::vector<uint8_t> grabCameraRGB(const std::string & cam_name, int width, int height);
+  void saveCameraPPM(const std::string & cam_name,
+                              const std::string & path,
+                              int width, int height);
+
+  struct CameraFrame
+  {
+    std::vector<uint8_t> rgb; // RGB8, row-major, already vertically flipped
+    int w = 0, h = 0;
+    double stamp = 0.0; // mj time (data->time)
+  };
+
+  mutable std::mutex cam_mtx_;
+  std::unordered_map<std::string, CameraFrame> cam_frames_;
+  int cam_w_ = 659, cam_h_ = 493;          // default capture size
+  std::vector<std::string> cam_names_;     // discovered MuJoCo camera names
+  size_t cam_capture_decim_ = 1;           // capture every frame (increase if you want to decimate)
+  size_t cam_capture_ctr_ = 0;
+  
+  
+  struct CamTex { GLuint id = 0; int w = 0, h = 0; };
+  std::unordered_map<std::string, CamTex> cam_textures_;
+  int selected_cam_idx_ = 0;      // default to first cam
+  bool show_cam_view_ = true;     // toggle window
+  
+  
   inline mc_control::MCGlobalController * get_controller() noexcept
   {
     return controller.get();

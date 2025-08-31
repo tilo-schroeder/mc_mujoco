@@ -10,6 +10,7 @@
 
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
+#include <GLFW/glfw3.h>
 
 #include "implot.h"
 
@@ -26,6 +27,9 @@ namespace bfs = boost::filesystem;
 
 namespace mc_mujoco
 {
+
+mjvScene offscreen_scene_{};
+bool offscreen_scene_inited_ = false;
 
 double MjRobot::PD(size_t jnt_id, double q_ref, double q, double qdot_ref, double qdot)
 {
@@ -110,16 +114,34 @@ MjSimImpl::MjSimImpl(const MjConfiguration & config)
   { return bfs::path(mc_mujoco::USER_FOLDER) / (robot_name + ".yaml"); };
   auto get_robot_cfg_path_global = [&](const std::string & robot_name)
   { return bfs::path(mc_mujoco::SHARE_FOLDER) / (robot_name + ".yaml"); };
+
+  mc_rtc::log::info("[mc_mujoco] USER_FOLDER={}", mc_mujoco::USER_FOLDER);
+  mc_rtc::log::info("[mc_mujoco] SHARE_FOLDER={}", mc_mujoco::SHARE_FOLDER);
+
+  auto log_paths_for = [&](const std::string & name) {
+    mc_rtc::log::info(
+      "[mc_mujoco] Looking for '{}' YAML at:\n  - {}\n  - {}",
+      name,
+      (bfs::path(mc_mujoco::USER_FOLDER) / (name + ".yaml")).string(),
+      (bfs::path(mc_mujoco::SHARE_FOLDER) / (name + ".yaml")).string()
+    );
+  };
+
   auto get_robot_cfg_path = [&](const std::string & robot_name) -> std::string
   {
+    log_paths_for(robot_name);
     if(bfs::exists(get_robot_cfg_path_local(robot_name)))
     {
+      mc_rtc::log::info("[mc_mujoco] Found YAML for '{}' in USER folder", robot_name);
       return get_robot_cfg_path_local(robot_name).string();
     }
     if(bfs::exists(get_robot_cfg_path_global(robot_name)))
     {
+      mc_rtc::log::info("[mc_mujoco] Found YAML for '{}' in SHARE folder", robot_name);
       return get_robot_cfg_path_global(robot_name).string();
     }
+    mc_rtc::log::warning(
+      "[mc_mujoco] No YAML found for '{}' (tried USER/SHARE folders)", robot_name);
     return "";
   };
 
@@ -200,6 +222,19 @@ MjSimImpl::MjSimImpl(const MjConfiguration & config)
   if(!initialized)
   {
     mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] Initialized failed.");
+  }
+
+  // after model/context are valid
+  mjv_defaultScene(&offscreen_scene_);
+  // Pick a generous maxgeom
+  const int maxgeom = 20000;
+  mjv_makeScene(model, &offscreen_scene_, maxgeom);
+  offscreen_scene_inited_ = true;
+
+  for(int i = 0; i < model->ncam; ++i)
+  {
+    const char * n = mj_id2name(model, mjOBJ_CAMERA, i);
+    if(n && *n) cam_names_.emplace_back(n);
   }
 
   // read PD gains from file
@@ -511,6 +546,29 @@ void MjSimImpl::makeDatastoreCalls()
   {
     ds.make_call(o.name + "::SetPosW", [this, name = o.name](const sva::PTransformd & pt) { setObjectPosW(name, pt); });
   }
+  
+  ds.make_call("MuJoCo::ListCameras", [this]() -> std::vector<std::string>
+  {
+    return cam_names_;
+  });
+
+  // Get the latest RGB frame for a camera (copy-out to the caller)
+  ds.make_call("MuJoCo::GetCameraRGB",
+               [this](const std::string & cam_name,
+                      std::vector<uint8_t> & out_rgb,
+                      int & out_w, int & out_h,
+                      double & out_stamp) -> bool
+               {
+                 std::lock_guard<std::mutex> lock(cam_mtx_);
+                 auto it = cam_frames_.find(cam_name);
+                 if(it == cam_frames_.end() || it->second.rgb.empty()) { return false; }
+                 out_rgb  = it->second.rgb;   // copy-out
+                 out_w    = it->second.w;
+                 out_h    = it->second.h;
+                 out_stamp= it->second.stamp;
+                 return true;
+               });
+  
   for(auto & r : robots)
   {
     ds.make_call(r.name + "::SetPosW", [this, name = r.name](const sva::PTransformd & pt) { setRobotPosW(name, pt); });
@@ -1071,6 +1129,22 @@ bool MjSimImpl::render()
   glfwSwapBuffers(window);
 #endif
 
+if((cam_capture_ctr_++ % cam_capture_decim_) == 0)
+{
+  for(const auto & cam_name : cam_names_)
+  {
+    auto rgb = grabCameraRGB(cam_name, cam_w_, cam_h_);
+    {
+      std::lock_guard<std::mutex> lock(cam_mtx_);
+      auto & f = cam_frames_[cam_name];
+      f.rgb   = std::move(rgb);
+      f.w     = cam_w_;
+      f.h     = cam_h_;
+      f.stamp = data->time;
+    }
+  }
+}
+
 #ifdef USE_UI_ADAPTER
   return !platform_ui_adapter->ShouldCloseWindow();
 #else
@@ -1159,6 +1233,68 @@ void MjSimImpl::loadPlugins(const mc_rtc::Configuration & mc_mujoco_cfg) const
   }
 }
 
+std::vector<uint8_t> MjSimImpl::grabCameraRGB(const std::string & cam_name, int width, int height)
+{
+  if(!offscreen_scene_inited_)
+  {
+    mc_rtc::log::error_and_throw<std::runtime_error>("[mc_mujoco] offscreen scene not initialized");
+  }
+
+  std::lock_guard<std::mutex> lock(rendering_mutex_);
+
+#ifdef USE_UI_ADAPTER
+  auto & ctx = platform_ui_adapter->mjr_context();
+#else
+  auto & ctx = context;
+#endif
+
+  // Render to offscreen buffer
+  mjr_setBuffer(mjFB_OFFSCREEN, &ctx);
+  mjr_resizeOffscreen(width, height, &ctx);
+
+  // Build a local camera that does NOT touch the viewer's camera
+  mjvCamera cam{};
+  cam = camera;                // copy current viewer camera for fovy etc.
+  cam.type = mjCAMERA_FIXED;
+  cam.fixedcamid = mj_name2id(model, mjOBJ_CAMERA, cam_name.c_str());
+  cam.trackbodyid = -1;        // make sure it's not tracking anything
+  if(cam.fixedcamid < 0)
+  {
+    mc_rtc::log::error_and_throw<std::runtime_error>(
+      fmt::format("[mc_mujoco] Camera '{}' not found", cam_name));
+  }
+
+  // Update a SEPARATE scene to not disturb the window
+  mjv_updateScene(model, data, &options, &pert, &cam, mjCAT_ALL, &offscreen_scene_);
+
+  mjrRect vp{0, 0, width, height};
+  mjr_render(vp, &offscreen_scene_, &ctx);
+
+  // Read RGB
+  std::vector<uint8_t> rgb(3 * width * height);
+  mjr_readPixels(rgb.data(), nullptr, vp, &ctx);
+
+  // Flip vertically so it looks "normal"
+  for(int y = 0; y < height/2; ++y)
+  {
+    int t = y * width * 3, b = (height - 1 - y) * width * 3;
+    for(int x = 0; x < width * 3; ++x) std::swap(rgb[t + x], rgb[b + x]);
+  }
+
+  // Restore window buffer for the viewer
+  mjr_setBuffer(mjFB_WINDOW, &ctx);
+  return rgb;
+}
+
+void MjSimImpl::saveCameraPPM(const std::string & cam_name,
+                              const std::string & path, int w, int h)
+{
+  auto rgb = grabCameraRGB(cam_name, w, h);
+  std::ofstream out(path, std::ios::binary);
+  out << "P6\n" << w << " " << h << "\n255\n";
+  out.write(reinterpret_cast<const char*>(rgb.data()), rgb.size());
+}
+
 MjSim::MjSim(const MjConfiguration & config) : impl(new MjSimImpl(config))
 {
   impl->startSimulation();
@@ -1167,6 +1303,10 @@ MjSim::MjSim(const MjConfiguration & config) : impl(new MjSimImpl(config))
 MjSim::~MjSim()
 {
   impl->cleanup();
+}
+
+void MjSim::saveCameraPPM(const std::string & cam_name, const std::string & path, int width, int height) {
+  impl->saveCameraPPM(cam_name, path, width, height);          
 }
 
 bool MjSim::stepSimulation()

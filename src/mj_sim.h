@@ -64,6 +64,11 @@ public:
   /** Return the MuJoCo data */
   mjData & data() noexcept;
 
+  /** Helper to save a ppm image */
+  void saveCameraPPM(const std::string & cam_name,
+                      const std::string & path,
+                      int width, int height);
+
 private:
   std::unique_ptr<MjSimImpl> impl;
 };
